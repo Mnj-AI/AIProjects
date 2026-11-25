@@ -1,0 +1,66 @@
+# PaddleOCR-VL Chat — two-service deployment.
+#
+#   ocr-server : vLLM serving PaddleOCR-VL (requires an NVIDIA GPU)
+#   ocr-chat   : FastAPI web app (CPU-only, built from docker/Dockerfile)
+#
+# Usage:
+#   docker compose -f docker/compose.yaml up -d
+#   First start downloads the model weights from Hugging Face (~1.7B params).
+#   The web UI is then available at http://localhost:8000
+
+services:
+  ocr-server:
+    # Pinned to a vLLM release that supports PaddleOCR-VL-1.6.
+    # `latest` is intentionally avoided so upgrades are explicit.
+    # Bump this tag deliberately and re-test before upgrading.
+    image: vllm/vllm-openai:v0.19.1
+    # The image's entrypoint is `vllm serve`; the first arg is the model.
+    command: >
+      PaddlePaddle/PaddleOCR-VL-1.6
+      --port 8091
+      --trust-remote-code
+      --max-model-len 8192
+    # No `ports:` mapping: the vLLM server is reachable only from the
+    # internal Docker network (ocr-chat). It has no authentication of its
+    # own and must never be exposed to the internet.
+    volumes:
+      # Persist model weights so restarts don't re-download.
+      - hf-cache:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 300s
+      retries: 5
+
+  ocr-chat:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      OCR_SERVER_URL: http://ocr-server:8091/v1
+      # REQUIRED in production: set a strong random token (e.g. `openssl rand -hex 32`)
+      # to enable authentication on /api/ocr and /download/*. Empty = auth disabled.
+      API_TOKEN: ""
+      # MAX_UPLOAD_MB: "50"
+      # OUTPUT_RETENTION_DAYS: "7"
+      # LOG_LEVEL: "INFO"
+    volumes:
+      - ocr-chat-output:/app/output
+    depends_on:
+      ocr-server:
+        condition: service_healthy
+
+volumes:
+  hf-cache:
+  ocr-chat-output:
