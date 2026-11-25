@@ -9,11 +9,16 @@ Two components:
 
 | Component | What it is | Runs on |
 |---|---|---|
-| **ocr-chat** (this repo) | FastAPI web app: upload UI, PDF splitting (pypdfium2), result collation, downloads | CPU, tiny |
+| **ocr-chat** (this repo) | FastAPI web app: upload UI, PDF splitting (pypdfium2), result collation, summarization | CPU, tiny |
 | **ocr-server** | vLLM serving `PaddlePaddle/PaddleOCR-VL-1.6` (OpenAI-compatible API) | NVIDIA GPU, ~1.7B weights |
+| **summarizer** | Any OpenAI-compatible chat server (e.g. vLLM) that summarizes the collated markdown | optional |
 
 The web app is a pure client of the inference server — point `OCR_SERVER_URL`
-at any OpenAI-compatible endpoint that can run the model.
+at any OpenAI-compatible endpoint that can run the model. After OCR completes,
+the full collated markdown is sent to an optional summarization server
+(`SUMMARIZER_URL`, default `http://localhost:8090/v1`) and the summary with
+key points is appended to the response. A summarizer failure never fails the
+OCR request — the result is returned with a `summary_error` note instead.
 
 ## Quick start (Docker Compose)
 
@@ -59,6 +64,10 @@ take precedence over `.env`.
 | `OCR_MODEL` | *(auto-detect)* | Model name; empty = first model from `/v1/models` |
 | `OCR_DPI` | `200` | Render DPI for PDF pages |
 | `OCR_TIMEOUT` | `3600` | Per-request timeout (seconds) |
+| `SUMMARIZER_URL` | `http://localhost:8090/v1` | OpenAI-compatible base URL of the summarization server |
+| `SUMMARIZER_MODEL` | *(auto-detect)* | Summarizer model name; empty = first model from `/v1/models` |
+| `SUMMARIZER_TIMEOUT` | `300` | Summarizer request timeout (seconds) |
+| `SUMMARIZER_ENABLED` | `1` | Set `0` to skip summarization entirely |
 | `HOST` | `0.0.0.0` | Bind address for the web app |
 | `PORT` | `8000` | Port for the web app |
 | `MAX_UPLOAD_MB` | `50` | Maximum upload size (MB) |
@@ -75,7 +84,10 @@ The UI has a token button (🔓/🔒) in the status bar; API clients send the
 ## API
 
 - `GET /api/health` — `{ok, model}` (or `{ok: false, error}`)
-- `POST /api/ocr` — multipart `file`; streams NDJSON `progress` / `error` / `result`
+- `POST /api/ocr` — multipart `file`; streams NDJSON `progress` / `error` / `result`.
+  The `result` event includes `summary` (markdown summary + key points from the
+  summarization server) and `summary_error` (set when summarization fails; the
+  OCR result itself is still returned).
 - `GET /download/{name}` — the generated Markdown file
 
 ## Repository layout

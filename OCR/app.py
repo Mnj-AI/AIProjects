@@ -58,6 +58,12 @@ OCR_SERVER_URL = os.getenv("OCR_SERVER_URL", "http://localhost:8091/v1").rstrip(
 OCR_MODEL = os.getenv("OCR_MODEL", "").strip()
 OCR_DPI = int(os.getenv("OCR_DPI", "200"))
 OCR_TIMEOUT = float(os.getenv("OCR_TIMEOUT", "3600"))
+SUMMARIZER_URL = os.getenv("SUMMARIZER_URL", "http://localhost:8090/v1").rstrip("/")
+SUMMARIZER_MODEL = os.getenv("SUMMARIZER_MODEL", "").strip()
+SUMMARIZER_TIMEOUT = float(os.getenv("SUMMARIZER_TIMEOUT", "300"))
+SUMMARIZER_ENABLED = os.getenv("SUMMARIZER_ENABLED", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
@@ -91,7 +97,16 @@ client = OpenAI(
     max_retries=0,
 )
 
+# OpenAI-compatible client pointing at the local summarization server.
+summarizer_client = OpenAI(
+    api_key="EMPTY",
+    base_url=SUMMARIZER_URL,
+    timeout=SUMMARIZER_TIMEOUT,
+    max_retries=0,
+)
+
 _model_cache: Optional[str] = None
+_summarizer_model_cache: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +176,38 @@ def ocr_image_bytes(image_bytes: bytes, mime: str = "image/png") -> str:
                 ],
             }
         ],
+        temperature=0.0,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+def get_summarizer_model_name() -> str:
+    """Return the configured summarizer model, or auto-detect from /models."""
+    global _summarizer_model_cache
+    if SUMMARIZER_MODEL:
+        return SUMMARIZER_MODEL
+    if _summarizer_model_cache:
+        return _summarizer_model_cache
+    models = summarizer_client.models.list()
+    if not models.data:
+        raise RuntimeError("Summarizer server returned no models")
+    _summarizer_model_cache = models.data[0].id
+    return _summarizer_model_cache
+
+
+def summarize_markdown(markdown: str) -> str:
+    """Send the full markdown to the summarizer and return summary markdown."""
+    prompt = (
+        "You are a document summarizer. Below is the full OCR-extracted "
+        "markdown of a document. Produce a concise summary (2-4 sentences) "
+        "followed by the most important points as a bulleted list. "
+        "Respond in markdown using a '## Summary' heading and a "
+        "'## Key Points' heading with a bulleted list.\n\n"
+        f"Document:\n\n{markdown}"
+    )
+    response = summarizer_client.chat.completions.create(
+        model=get_summarizer_model_name(),
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
     )
     return (response.choices[0].message.content or "").strip()
@@ -290,6 +337,22 @@ async def api_ocr(file: UploadFile = File(...)):
         out_name = f"{int(time.time())}_{sanitize_filename(filename)}"
         (OUTPUT_DIR / out_name).write_text(markdown, encoding="utf-8")
         logger.info("Saved %s (%d page(s))", out_name, len(pages))
+
+        summary = None
+        summary_error = None
+        if SUMMARIZER_ENABLED:
+            yield ndjson({
+                "type": "progress",
+                "page": len(pages),
+                "total": len(pages),
+                "status": "Summarizing…",
+            })
+            try:
+                summary = summarize_markdown(markdown)
+            except Exception as exc:  # noqa: BLE001
+                summary_error = str(exc)
+                logger.warning("Summarization failed: %s", exc)
+
         yield ndjson({
             "type": "result",
             "markdown": markdown,
@@ -297,6 +360,8 @@ async def api_ocr(file: UploadFile = File(...)):
             "kind": kind,
             "page_count": len(pages),
             "download_url": f"/download/{out_name}",
+            "summary": summary,
+            "summary_error": summary_error,
         })
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
